@@ -195,9 +195,9 @@ configs.append(
                 x_names=["N_CTX"],
                 x_vals=[2**i for i in range(10, 15)],
                 line_arg="provider",
-                line_vals=["triton-fp16", "flash-v2"],
-                line_names=["Triton [FP16]", "Flash-v2 [FP16]"],
-                styles=[("red", "-"), ("blue", "-")],
+                line_vals=["triton-fp16", "flash-v2", "pytorch"],
+                line_names=["Triton [FP16]", "Flash-v2 [FP16]", "pytorch [FP16]"],
+                styles=[("red", "-"), ("blue", "-"), ("green", "-")],
                 ylabel="ms",
                 plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
                 args={
@@ -207,6 +207,17 @@ configs.append(
                 },
             ))
 
+# 标准的softmax计算，直接以e为底计算幂函数, 更准确.
+def torch_attention_standard(Q, K, V, sm_scale):
+    qk = torch.matmul(Q, K.transpose(-2, -1))  # Compute the dot product
+    qk_scale = sm_scale
+    qk *= qk_scale
+    mask = torch.triu(torch.ones_like(qk) * float(-1.0e6), diagonal=1)
+    qk = qk + mask
+    qk = qk - torch.max(qk, dim=-1, keepdim=True)[0]
+    qk_score = torch.exp(qk) / torch.exp(qk).sum(dim=-1, keepdim=True)
+    O = torch.matmul(qk_score, V)  # Multiply scores with V
+    return O
 
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, provider, device="cuda"):
@@ -226,41 +237,18 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, provider, device="cuda"):
         v = torch.randn((BATCH, N_CTX, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=False)
         fn = lambda: flash_attn_func(q=q, k=k, v=v, dropout_p=float(0.0), softmax_scale=1.3, causal=True, window_size=(-1,-1), alibi_slopes=None, deterministic=False)
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    if provider == "pytorch":
+        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=False)
+        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=False)
+        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=False)
+        fn = lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.3) 
+        #fn = lambda: torch_attention_standard_v2(q, k, v, 1.3) 
+        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
     total_flops = 2 * flops_per_matmul
     total_flops *= 0.5
     return total_flops / ms * 1e-9
-"""
-    if flash_attention:
-          query_states = self.q_proj(hidden_states)
-          key_states = key_states.transpose(1, 2)
-          value_states = value_states.transpose(1, 2)
-          if flash_attn.__version__ >= "2.0":
-            query_states = query_states.view(bsz, tgt_len, self.num_heads, self.head_dim)
-            attn_output = flash_attn_func(query_states, key_states, value_states, self.dropout, self.scaling, True)
-          else:
-            query_states = query_states.view(bsz * tgt_len, self.num_heads, self.head_dim)
-            key_states = key_states.view(bsz * tgt_len, self.num_heads, self.head_dim)
-            value_states = value_states.view(bsz * tgt_len, self.num_heads, self.head_dim)
-            qkv = torch.stack([query_states, key_states, value_states], dim=1)
-            cu_seqlens = torch.arange(0, (bsz + 1) * tgt_len, tgt_len, dtype=torch.int32, device=query_states.device)
-            attn_output = flash_attn_func(qkv, cu_seqlens, self.dropout, tgt_len, self.scaling, True, False)
-          attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
-          attn_output = self.out_proj(attn_output)
-          return attn_output, None, past_key_value
-"""
-
-# 标准的softmax计算，直接以e为底计算幂函数, 更准确.
-def torch_attention_standard(Q, K, V, sm_scale):
-    qk = torch.matmul(Q, K.transpose(-2, -1))  # Compute the dot product
-    qk_scale = sm_scale
-    qk *= qk_scale
-    mask = torch.triu(torch.ones_like(qk) * float(-1.0e6), diagonal=1)
-    qk = qk + mask
-    qk = qk - torch.max(qk, dim=-1, keepdim=True)[0]
-    qk_score = torch.exp(qk) / torch.exp(qk).sum(dim=-1, keepdim=True)
-    O = torch.matmul(qk_score, V)  # Multiply scores with V
-    return O
 
 # 模仿flashattention以2为底做幂函数计算，需要前置乘以log2e，结果更接近FlashAttention计算结果.
 # 误差是FlashAttention分块计算的scale的误差.
@@ -284,7 +272,8 @@ if __name__ == "__main__":
     v = torch.randn((4, 32, 1024, 64), dtype=torch.float16, device="cuda")
     sm_scale = 1.3
     o_triton = attention(q, k, v, sm_scale)
-    o_torch = torch_attention(q, k, v, sm_scale)
+    #o_torch = torch_attention_standard_v2(q, k, v, sm_scale)
+    o_torch = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale) 
     assert o_triton.shape == (4, 32, 1024, 64)
     assert o_torch.shape == (4, 32, 1024, 64)
     assert torch.allclose(o_triton[0][0], o_torch[0][0], rtol=0.25*1e-2, atol=0.3*1e-1), (o_triton[0][0], o_torch[0][0])
