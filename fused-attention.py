@@ -165,7 +165,6 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
                                         2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
                                         )
     # epilogue
-    m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
