@@ -639,6 +639,20 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
         total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
     return total_flops / ms * 1e-9
 
+# 标准的softmax计算，直接以e为底计算幂函数, 更准确.
+def torch_attention_standard(Q, K, V, sm_scale):
+    qk = torch.matmul(Q, K.transpose(-2, -1))  # Compute the dot product
+    qk_scale = sm_scale
+    qk *= qk_scale
+    mask = torch.triu(torch.ones_like(qk) * float(-1.0e6), diagonal=1)
+    qk = qk + mask
+    qk = qk - torch.max(qk, dim=-1, keepdim=True)[0]
+    qk_score = torch.exp(qk) / torch.exp(qk).sum(dim=-1, keepdim=True)
+    O = torch.matmul(qk_score, V)  # Multiply scores with V
+    return O
+
+# 模仿flashattention以2为底做幂函数计算，需要前置乘以log2e，结果更接近FlashAttention计算结果.
+# 误差是FlashAttention分块计算的scale的误差.
 def torch_attention(Q, K, V, sm_scale):
     qk = torch.matmul(Q, K.transpose(-2, -1))  # Compute the dot product
     qk_scale = sm_scale
@@ -647,8 +661,7 @@ def torch_attention(Q, K, V, sm_scale):
     mask = torch.triu(torch.ones_like(qk) * float(-1.0e6), diagonal=1)
     qk = qk + mask
     qk = qk - torch.max(qk, dim=-1, keepdim=True)[0]
-    qk_score = torch.pow(2, qk) / torch.pow(2, qk).sum(dim=-1, keepdim=True)  # Apply softmax with base 2
-    #qk_score = F.softmax(qk, dim=-1)  # Apply softmax to get scores
+    qk_score = torch.pow(2, qk) / torch.pow(2, qk).sum(dim=-1, keepdim=True)
     O = torch.matmul(qk_score, V)  # Multiply scores with V
     return O
 
